@@ -1,0 +1,198 @@
+name: Build commonLuke
+
+# X-ray + AutoMiner eklendikten sonraki hâl için güncellendi.
+# Akış: ana dizindeki .zip -> aç -> eksik test kaynaklarını sahte (stub) ile
+# tamamla -> JDK yolunu gerçek JDK'ya bağla -> 1234 anahtarı -> build ->
+# doğrula -> commonLukeLoader.exe artifact.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Extract ZIP & Apply Patches
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $zip = Get-ChildItem -Filter *.zip | Select-Object -First 1
+          if (-not $zip) { throw "Ana dizinde .zip dosyasi bulunamadi!" }
+          Write-Host "Zip bulundu: $($zip.Name) ($([math]::Round($zip.Length/1MB,2)) MB)"
+          Expand-Archive -Path $zip.FullName -DestinationPath extracted -Force
+
+          $cmake = Get-ChildItem -Path extracted -Recurse -Filter CMakeLists.txt |
+                   Where-Object { (Get-Content $_.FullName -Raw) -match 'project\(sonoyuncu_jni' } |
+                   Select-Object -First 1
+          if (-not $cmake) { throw "CMakeLists.txt bulunamadi!" }
+          $srcDir = $cmake.DirectoryName
+          Write-Host "Kaynak dizin: $srcDir"
+          "SRC_DIR=$srcDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # --- 0) Zip gercekten yeni surum mu? (X-ray + AutoMiner kaynaklari) ---
+          $required = @(
+            'native/include/features/visual/xray/Xray.hpp',
+            'native/src/features/visual/xray/XraySettings.cpp',
+            'native/src/features/visual/xray/XrayCapture.cpp',
+            'native/src/features/visual/xray/XrayRender.cpp',
+            'native/include/features/utility/auto_miner/AutoMiner.hpp',
+            'native/src/features/utility/auto_miner/AutoMinerSettings.cpp',
+            'native/src/features/utility/auto_miner/AutoMinerRuntime.cpp',
+            'native/include/features/utility/ore/OreTargets.hpp',
+            'native/include/features/utility/ore/OreScan.hpp',
+            'native/src/features/utility/ore/OreScan.cpp'
+          )
+          foreach ($relative in $required) {
+            if (-not (Test-Path (Join-Path $srcDir $relative))) {
+              throw "Eksik yeni kaynak: $relative (yanlis/eski zip yuklenmis olabilir)"
+            }
+          }
+          Write-Host "Yeni X-ray/AutoMiner kaynaklari zip icinde dogrulandi ($($required.Count) dosya)."
+
+          # --- 1) CMake'in istedigi ama arsivde olmayan test/kaynak dosyalari ---
+          # Bu hedefler EXCLUDE_FROM_ALL; hicbir zaman derlenmiyorlar. Sadece
+          # configure'un "Cannot find source file" hatasi vermemesi icin bos
+          # govde birakiyoruz.
+          $manifests = @(
+            (Join-Path $srcDir 'CMakeLists.txt'),
+            (Join-Path $srcDir 'native/CMakeLists.txt'),
+            (Join-Path $srcDir 'loader/CMakeLists.txt')
+          )
+          $pattern = '(?<![\w.-])((?:tests|tools)/[A-Za-z0-9_./-]+\.(?:cpp|cxx|cc|hpp|h))'
+          $stubs = 0
+          foreach ($manifest in $manifests) {
+            if (-not (Test-Path $manifest)) { continue }
+            $text = Get-Content $manifest -Raw
+            foreach ($match in [regex]::Matches($text, $pattern)) {
+              $relative = $match.Groups[1].Value
+              $target = Join-Path $srcDir ($relative -replace '/', '\')
+              if (Test-Path $target) { continue }
+              New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
+              if ($relative -like '*.h') {
+                $body = "// CI stub: CMake referansi var, arsivde dosya yok.`n#pragma once`n"
+              } else {
+                $body = "// CI stub: CMake referansi var, arsivde dosya yok.`n// Hedef EXCLUDE_FROM_ALL; bu workflow bunu derlemiyor.`nint main() { return 0; }`n"
+              }
+              Set-Content -Path $target -Value $body -NoNewline
+              Write-Host "stub olusturuldu: $relative"
+              $stubs++
+            }
+          }
+          Write-Host "Toplam stub: $stubs"
+
+          # --- 2) Sabit JDK yolunu gercek JDK'ya bagla ---
+          $javac = (Get-Command javac.exe -ErrorAction SilentlyContinue).Source
+          if (-not $javac -and $env:JAVA_HOME) { $javac = Join-Path $env:JAVA_HOME 'bin/javac.exe' }
+          if (-not $javac) { throw "javac.exe bulunamadi (Setup JDK adimi calisti mi?)" }
+          $jdkBin = Split-Path $javac
+          if (-not (Test-Path (Join-Path $jdkBin 'jar.exe'))) { throw "jar.exe bulunamadi: $jdkBin" }
+          $jdkBinPosix = $jdkBin -replace '\\','/'
+
+          $nativeCmake = Join-Path $srcDir 'native/CMakeLists.txt'
+          $content = Get-Content $nativeCmake -Raw
+          if ($content -match 'set\(proxy_jdk "[^"]*"\)') {
+            $content = [regex]::Replace($content, 'set\(proxy_jdk "[^"]*"\)',
+              "set(proxy_jdk `"$jdkBinPosix`")")
+            Set-Content $nativeCmake -Value $content -NoNewline
+            Write-Host "proxy_jdk -> $jdkBinPosix"
+          } else {
+            Write-Host "proxy_jdk sabiti bulunamadi; CMake zaten JDK'yi kendisi buluyor."
+          }
+
+          # --- 3) Sifreyi 1234 yap ---
+          $cipherJson = Join-Path $srcDir "loader/payload-cipher.json"
+          @'
+          {
+            "password_sha256": "03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4",
+            "salt": "332cf5f13518513ce9efa9db1affa2ef",
+            "nonce": "1db6668a8a04d968750f6e4f",
+            "iterations": 180000
+          }
+          '@ | Set-Content $cipherJson
+
+          # --- 4) Key sormadan otomatik yukleme (LoaderUi.cpp) ---
+          $uiCpp = Join-Path $srcDir "loader/src/LoaderUi.cpp"
+          $uiContent = Get-Content $uiCpp -Raw
+          $uiPatched = $uiContent -replace 'if \(state\.progressStarted < 0\.0 && submitted && state\.accessKey\[0\] != ''\\0''\) \{\s*state\.progressStarted = elapsed;\s*std::string accessKey\(state\.accessKey\.data\(\)\);',
+            "if (state.progressStarted < 0.0) {`n        state.progressStarted = elapsed;`n        std::string accessKey = `"1234`";"
+          if ($uiPatched -eq $uiContent) {
+            Write-Warning "LoaderUi.cpp otomatik-key yamasi uygulanamadi; loader anahtari soracak (1234)."
+          } else {
+            Set-Content $uiCpp -Value $uiPatched -NoNewline
+            Write-Host "LoaderUi.cpp: otomatik key 1234 yamasi uygulandi."
+          }
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S "${{ env.SRC_DIR }}" -B build -G "Visual Studio 17 2022" -A x64 `
+            -DBUILD_TESTING=OFF `
+            -DAOKI_BUILD_HUD_SMOKE=OFF `
+            -DAOKI_ENABLE_LOGGING=ON
+
+      - name: Build Loader EXE (payload DLL dahil)
+        shell: pwsh
+        run: |
+          # aoki_loader, sonoyuncu_jni'ye bagli: bu hedef hem commonLuke.dll'i
+          # hem de icine gomulu commonLukeLoader.exe'yi uretir.
+          cmake --build build --config Release --target aoki_loader --parallel
+
+      - name: Verify payload and new features
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = Join-Path $env:GITHUB_WORKSPACE 'build/bin'
+          $exe = Join-Path $bin 'commonLukeLoader.exe'
+          $dll = Join-Path $bin 'commonLuke.dll'
+          foreach ($file in @($exe, $dll)) {
+            if (-not (Test-Path $file)) { throw "Build ciktisi yok: $file" }
+            $info = Get-Item $file
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash
+            Write-Host ("{0,-22} {1,12:N0} bytes  sha256={2}" -f $info.Name, $info.Length, $hash)
+          }
+
+          # Yeni feature kaynaklari gercekten DLL'e linklendi mi?
+          $ascii = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($dll))
+          $missing = @()
+          foreach ($token in @('[OreScan]', '[Xray]', '[AutoMiner]')) {
+            if ($ascii.Contains($token)) { Write-Host "linked: $token" }
+            else { $missing += $token }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Warning ("DLL icinde bulunamayan isaretler: " + ($missing -join ', ') +
+              ". AOKI_ENABLE_LOGGING kapaliysa normaldir; degilse FeatureSources.cmake kontrol et.")
+          } else {
+            Write-Host "X-ray + AutoMiner kaynaklari commonLuke.dll icine linklendi."
+          }
+
+      - name: Upload EXE Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: commonLukeLoader
+          path: build/bin/commonLukeLoader.exe
+          if-no-files-found: error
+          retention-days: 30
